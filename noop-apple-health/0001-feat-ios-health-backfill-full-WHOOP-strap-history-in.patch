@@ -1,0 +1,342 @@
+From 863e15d493230b98a19ccdb5ed98aa623aee04d8 Mon Sep 17 00:00:00 2001
+From: Munther AlTawash <meemz28@gmail.com>
+Date: Fri, 20 Nov 2026 10:18:36 +0000
+Subject: [PATCH] feat(ios/health): backfill full WHOOP/strap history into
+ Apple Health
+
+Routine write-back only covers the trailing 14 days, so an imported WHOOP
+CSV history never reaches Apple Health. Adds HealthKitBridge.backfillHistory
+(days:) which walks the range in 30-day, local-noon-aligned chunks (newest
+first) and reuses the existing idempotent vitals/sleep/workout writers.
+Adds a 'Backfill history' control (90d / 1y / everything) to the Apple
+Health card, and unit tests for the pure chunking helper.
+---
+ .../StrandImport/HealthWriteback.swift        | 56 +++++++++++
+ .../HealthWritebackBackfillTests.swift        | 59 ++++++++++++
+ Strand/Screens/AppleHealthView.swift          | 46 ++++++++++
+ StrandiOS/Health/HealthKitBridge.swift        | 92 ++++++++++++++++++-
+ 4 files changed, 248 insertions(+), 5 deletions(-)
+ create mode 100644 Packages/StrandImport/Tests/StrandImportTests/HealthWritebackBackfillTests.swift
+
+diff --git a/Packages/StrandImport/Sources/StrandImport/HealthWriteback.swift b/Packages/StrandImport/Sources/StrandImport/HealthWriteback.swift
+index fd8d5d0..d576e13 100644
+--- a/Packages/StrandImport/Sources/StrandImport/HealthWriteback.swift
++++ b/Packages/StrandImport/Sources/StrandImport/HealthWriteback.swift
+@@ -247,4 +247,60 @@ public enum HealthWriteback {
+     public static func strandedSweepResult(swept: Set<String>, succeededThisRun: Set<String>) -> Set<String> {
+         swept.union(succeededThisRun)
+     }
++
++    // MARK: - History backfill windows
++    //
++    // The routine write-back covers only the trailing 14 days. A user who imports years of WHOOP CSV
++    // history (or has months of strap data from before they granted Health access) needs a one-shot
++    // backfill that pushes the WHOLE history into Apple Health. Doing that as one pass would blow the
++    // per-read limits (`sleepSessions(limit: 200)`, `workoutReadLimit`) and build one enormous
++    // `HKHealthStore.save` batch, so the bridge walks the range in fixed chunks instead.
++
++    /// One backfill chunk, `[fromTs, toTs)` in unix seconds.
++    public struct BackfillWindow: Equatable, Sendable {
++        public let fromTs: Int
++        public let toTs: Int
++        public init(fromTs: Int, toTs: Int) { self.fromTs = fromTs; self.toTs = toTs }
++    }
++
++    /// Default chunk size. 30 nights stays well under the 200-session sleep read limit (naps
++    /// included) and the 500-workout read limit, and keeps each HealthKit save batch small.
++    public static let backfillChunkDays = 30
++
++    /// Split `[fromTs, toTs)` into chunks of `chunkDays`, NEWEST FIRST so the most relevant history
++    /// lands in Health before older data if the pass is interrupted.
++    ///
++    /// Interior boundaries sit at LOCAL NOON (`utcOffsetSec` = the zone's offset from GMT): a night is
++    /// queried by its start time, and no sleep starts at midday, so a night and its naps never straddle
++    /// two chunks. That matters because the sleep write merges a night's fragments into ONE Health entry
++    /// keyed by the earliest fragment, and a split would write the halves as two entries. The outer edges
++    /// are kept exactly as given. An empty or inverted range yields no windows.
++    public static func backfillWindows(fromTs: Int, toTs: Int, chunkDays: Int = backfillChunkDays,
++                                       utcOffsetSec: Int) -> [BackfillWindow] {
++        guard toTs > fromTs, chunkDays > 0 else { return [] }
++        let day = 86_400
++        let span = chunkDays * day
++        // The last local noon at or before toTs, in UTC seconds.
++        let localTo = toTs + utcOffsetSec
++        var localNoon = localTo - ((localTo % day) + day) % day + day / 2
++        if localNoon > localTo { localNoon -= day }
++        var boundary = localNoon - utcOffsetSec
++        var windows: [BackfillWindow] = []
++        var upper = toTs
++        // First chunk may be shorter (up to the most recent noon); later chunks are exactly `span`.
++        if boundary <= fromTs {
++            return [BackfillWindow(fromTs: fromTs, toTs: toTs)]
++        }
++        if boundary < upper {
++            windows.append(BackfillWindow(fromTs: boundary, toTs: upper))
++            upper = boundary
++        }
++        while upper > fromTs {
++            boundary = upper - span
++            let lower = max(boundary, fromTs)
++            windows.append(BackfillWindow(fromTs: lower, toTs: upper))
++            upper = lower
++        }
++        return windows
++    }
+ }
+diff --git a/Packages/StrandImport/Tests/StrandImportTests/HealthWritebackBackfillTests.swift b/Packages/StrandImport/Tests/StrandImportTests/HealthWritebackBackfillTests.swift
+new file mode 100644
+index 0000000..de2eb2b
+--- /dev/null
++++ b/Packages/StrandImport/Tests/StrandImportTests/HealthWritebackBackfillTests.swift
+@@ -0,0 +1,59 @@
++import XCTest
++@testable import StrandImport
++
++final class HealthWritebackBackfillTests: XCTestCase {
++
++    private let day = 86_400
++
++    /// Windows must tile the range exactly: contiguous, newest first, no gaps or overlaps.
++    private func assertTiles(_ w: [HealthWriteback.BackfillWindow], from: Int, to: Int,
++                             file: StaticString = #filePath, line: UInt = #line) {
++        XCTAssertFalse(w.isEmpty, file: file, line: line)
++        XCTAssertEqual(w.first?.toTs, to, file: file, line: line)
++        XCTAssertEqual(w.last?.fromTs, from, file: file, line: line)
++        for (a, b) in zip(w, w.dropFirst()) {
++            XCTAssertEqual(a.fromTs, b.toTs, "gap/overlap between chunks", file: file, line: line)
++            XCTAssertLessThan(b.fromTs, b.toTs, file: file, line: line)
++        }
++    }
++
++    func testEmptyAndInvertedRangesYieldNothing() {
++        XCTAssertEqual(HealthWriteback.backfillWindows(fromTs: 100, toTs: 100, utcOffsetSec: 0), [])
++        XCTAssertEqual(HealthWriteback.backfillWindows(fromTs: 200, toTs: 100, utcOffsetSec: 0), [])
++        XCTAssertEqual(HealthWriteback.backfillWindows(fromTs: 0, toTs: 100, chunkDays: 0, utcOffsetSec: 0), [])
++    }
++
++    func testOneYearTilesIntoThirtyDayChunksAtLocalNoon() {
++        // 2026-11-20 15:00 Dubai (UTC+4) = 11:00Z.
++        let offset = 4 * 3600
++        let to = 1_795_132_800 + 11 * 3600   // 2026-11-20T11:00:00Z
++        let from = to - 365 * day
++        let w = HealthWriteback.backfillWindows(fromTs: from, toTs: to, utcOffsetSec: offset)
++        assertTiles(w, from: from, to: to)
++        // Every interior boundary is local noon.
++        for b in w.dropLast().map(\.fromTs) {
++            XCTAssertEqual(((b + offset) % day + day) % day, day / 2, "boundary \(b) is not local noon")
++        }
++        // Interior chunks are exactly 30 days.
++        for c in w.dropFirst().dropLast() { XCTAssertEqual(c.toTs - c.fromTs, 30 * day) }
++        XCTAssertLessThanOrEqual(w.count, 14)
++    }
++
++    func testRangeShorterThanToNoonIsOneWindow() {
++        // 2026-11-20 13:00Z..14:00Z, offset 0 → the last noon (12:00Z) is before `from`.
++        let from = 1_795_132_800 + 13 * 3600
++        let w = HealthWriteback.backfillWindows(fromTs: from, toTs: from + 3600, utcOffsetSec: 0)
++        XCTAssertEqual(w, [.init(fromTs: from, toTs: from + 3600)])
++    }
++
++    func testNegativeOffsetZone() {
++        let offset = -8 * 3600
++        let to = 1_795_132_800 + 3 * 3600
++        let from = to - 100 * day
++        let w = HealthWriteback.backfillWindows(fromTs: from, toTs: to, utcOffsetSec: offset)
++        assertTiles(w, from: from, to: to)
++        for b in w.dropLast().map(\.fromTs) {
++            XCTAssertEqual(((b + offset) % day + day) % day, day / 2)
++        }
++    }
++}
+diff --git a/Strand/Screens/AppleHealthView.swift b/Strand/Screens/AppleHealthView.swift
+index 6e93e7a..dc76e53 100644
+--- a/Strand/Screens/AppleHealthView.swift
++++ b/Strand/Screens/AppleHealthView.swift
+@@ -367,6 +367,50 @@ struct AppleHealthView: View {
+     // shows the system permission sheet (rationale strings ship in the iOS target's Info.plist), then
+     // runs the first read + write-back and refreshes this screen. Once authorized, a "Sync now"
+     // control and last-synced/status line take its place.
++    #if os(iOS)
++    /// Routine write-back covers only the last 14 days; this pushes the whole WHOOP / strap history
++    /// (e.g. right after a WHOOP CSV import) into Apple Health. Idempotent — safe to re-run.
++    @ViewBuilder
++    private var historyBackfillControls: some View {
++        Divider().padding(.vertical, 4)
++        Text("Send WHOOP history to Apple Health")
++            .font(StrandFont.subhead)
++            .foregroundStyle(StrandPalette.textPrimary)
++        Text("Automatic sync only covers the last 14 days. Use this after importing a WHOOP export to copy older sleep, recovery vitals and workouts into Health. Re-running replaces, never duplicates.")
++            .font(StrandFont.caption)
++            .foregroundStyle(StrandPalette.textTertiary)
++            .fixedSize(horizontal: false, vertical: true)
++        if let p = health.backfillProgress {
++            ProgressView(value: p) { Text("Backfilling… \(Int(p * 100))%").font(StrandFont.caption) }
++                .tint(StrandPalette.metricCyan)
++        } else {
++            Menu {
++                Button("Last 90 days") { runBackfill(days: 90) }
++                Button("Last year") { runBackfill(days: 365) }
++                Button("Everything") { runBackfill(days: nil) }
++            } label: {
++                Label("Backfill history", systemImage: "clock.arrow.circlepath")
++            }
++            .buttonStyle(.bordered)
++            .tint(StrandPalette.metricCyan)
++            .disabled(health.syncing)
++        }
++        if let summary = health.lastBackfillSummary {
++            Text(summary)
++                .font(StrandFont.footnote)
++                .foregroundStyle(StrandPalette.textSecondary)
++                .fixedSize(horizontal: false, vertical: true)
++        }
++    }
++
++    private func runBackfill(days: Int?) {
++        Task {
++            await health.backfillHistory(days: days)
++            await load()
++        }
++    }
++    #endif
++
+     #if os(iOS)
+     @ViewBuilder
+     private var liveSyncCard: some View {
+@@ -467,6 +511,8 @@ struct AppleHealthView: View {
+                     .buttonStyle(.bordered)
+                     .tint(StrandPalette.metricCyan)
+                     .disabled(health.syncing)
++
++                    historyBackfillControls
+                 }
+ 
+                 if let err = health.lastError {
+diff --git a/StrandiOS/Health/HealthKitBridge.swift b/StrandiOS/Health/HealthKitBridge.swift
+index cb844c5..b9e528e 100644
+--- a/StrandiOS/Health/HealthKitBridge.swift
++++ b/StrandiOS/Health/HealthKitBridge.swift
+@@ -31,6 +31,10 @@ final class HealthKitBridge: ObservableObject {
+     @Published private(set) var auth: AuthState = .unknown
+     @Published private(set) var lastSync: Date?
+     @Published private(set) var syncing = false
++    /// History backfill progress (0...1) while `backfillHistory` runs, nil otherwise.
++    @Published private(set) var backfillProgress: Double?
++    /// Outcome line of the last history backfill, for the Apple Health card.
++    @Published private(set) var lastBackfillSummary: String?
+     /// Coalesces a fresh-data notification that arrives while another HealthKit pass owns the bridge.
+     /// Without this, a strap offload finishing during the foreground read/write pass was deferred until
+     /// the next app open even though the newly-banked rows were already available locally.
+@@ -872,13 +876,92 @@ final class HealthKitBridge: ObservableObject {
+         // the HR path uses), then the normal writes re-add them under the new keys. Runs once,
+         // gated by a UserDefaults flag, BEFORE the new-key writes so nothing is lost.
+         await attempt { try await migrateStrandedHealthRecords(fromTs: fromTs, nowTs: nowTs) }
+-        await attempt { try await writeVitals(whoopStore: whoopStore, days: days, sessions: sessions, holdingDays: openDays) }
++        await attempt { try await writeVitals(whoopStore: whoopStore, fromTs: fromTs, toTs: nowTs, sessions: sessions, holdingDays: openDays) }
+         await attempt { try await writeSleep(sessions: sessions) }
+         await attempt { try await writeHeartRate(fromTs: fromTs, nowTs: nowTs) }
+         await attempt { try await writeWorkouts(whoopStore: whoopStore, fromTs: fromTs, toTs: nowTs) }
+         if let firstError { throw firstError }
+     }
+ 
++    // MARK: - History backfill (WHOOP history → Health)
++
++    /// Push NOOP's WHOLE history — imported WHOOP CSV rows (`physiological_cycles`, `sleeps`,
++    /// `workouts`) and strap-computed rows alike — into Apple Health, not just the trailing 14 days the
++    /// routine `writeBack` covers.
++    ///
++    /// Walks `[now - days, now)` in `HealthWriteback.backfillWindows` chunks, newest first, and runs the
++    /// SAME per-feature writers as the routine pass for each chunk: nightly vitals (RHR, HRV SDNN, SpO₂,
++    /// respiratory rate), sleep with stages, and workouts. Because those writers delete-then-write on
++    /// the deterministic `noop:<kind>:<identity>` keys, the backfill is idempotent: running it twice,
++    /// or a later routine write-back over the same days, replaces rather than duplicates.
++    ///
++    /// Deliberately NOT included: the continuous 1-minute heart-rate stream. A WHOOP CSV carries none,
++    /// and re-walking months of strap HR would bloat the Health store by ~1.4k samples/day; HR keeps its
++    /// own forward cursor in `writeHeartRate`. Not included either: the open-night hold (only the
++    /// newest chunk can contain a night still recording, and the routine pass owns that) and the #1503
++    /// stranded sweep (one-off, owned by the routine pass).
++    ///
++    /// Shares the `syncing` single-flight flag so it never interleaves with `sync`/`writeBack`.
++    /// - Parameter days: how far back to go. `nil` = everything (capped at 10 years).
++    /// - Returns: true when every chunk saved without error.
++    @discardableResult
++    func backfillHistory(days: Int?) async -> Bool {
++        refreshAuthIfPreviouslyGranted()
++        guard auth == .authorized else { return false }
++        guard !syncing else { return false }
++        syncing = true
++        backfillProgress = 0
++        defer {
++            backfillProgress = nil
++            finishHealthPass()
++        }
++        guard let whoopStore = await repo.storeHandle() else { return false }
++
++        let nowTs = Int(Date().timeIntervalSince1970)
++        let span = min(days ?? 3_650, 3_650)
++        // The trailing 2 days stay with the routine pass, which knows whether last night is still open.
++        let toTs = nowTs - 2 * 86_400
++        let fromTs = nowTs - span * 86_400
++        let windows = HealthWriteback.backfillWindows(fromTs: fromTs, toTs: toTs,
++                                                      utcOffsetSec: TimeZone.current.secondsFromGMT())
++        var failures = 0
++        var nights = 0
++        var firstError: Error?
++        for (i, w) in windows.enumerated() {
++            if Task.isCancelled { break }
++            let computed = (try? await whoopStore.sleepSessions(deviceId: computedDeviceId, from: w.fromTs,
++                                                                to: w.toTs, limit: 200)) ?? []
++            let imported = (try? await whoopStore.sleepSessions(deviceId: noopDeviceId, from: w.fromTs,
++                                                                to: w.toTs, limit: 200)) ?? []
++            var byStart: [Int: CachedSleepSession] = [:]
++            for s in computed { byStart[s.startTs] = s }
++            for s in imported { byStart[s.startTs] = s }   // imported wins, same precedence as writeBack
++            let sessions = byStart.keys.sorted().map { byStart[$0]! }
++            nights += sessions.count
++            var chunkFailed = false
++            func attempt(_ op: () async throws -> Void) async {
++                do { try await op() } catch {
++                    chunkFailed = true
++                    if firstError == nil { firstError = error }
++                }
++            }
++            await attempt { try await writeVitals(whoopStore: whoopStore, fromTs: w.fromTs, toTs: w.toTs,
++                                                  sessions: sessions) }
++            await attempt { try await writeSleep(sessions: sessions) }
++            await attempt { try await writeWorkouts(whoopStore: whoopStore, fromTs: w.fromTs, toTs: w.toTs) }
++            if chunkFailed { failures += 1 }
++            backfillProgress = Double(i + 1) / Double(max(windows.count, 1))
++        }
++        if let firstError {
++            lastError = String(localized: "Apple Health history backfill failed: \(firstError.localizedDescription)")
++            lastBackfillSummary = String(localized: "Backfill finished with errors in \(failures) of \(windows.count) chunks.")
++            return false
++        }
++        lastError = nil
++        lastBackfillSummary = String(localized: "Sent \(nights) nights plus their vitals and workouts to Apple Health.")
++        return true
++    }
++
+     /// UserDefaults key for the #1503 stranded-records sweep completion set. Stores the set of
+     /// type ids whose sweep delete has SUCCEEDED, so a type that was unauthorized or whose delete
+     /// failed is retried on a later write-back run rather than abandoned. Per-type (not a single
+@@ -951,12 +1034,11 @@ final class HealthKitBridge: ObservableObject {
+     /// The nightly vitals write (the original write-back), now stamped at the day's wake time when
+     /// that day has a sleep session — a real timestamp inside the night the value describes, instead
+     /// of a fabricated noon. Keys are unchanged, so re-stamped samples replace their noon ancestors.
+-    private func writeVitals(whoopStore: WhoopStore, days: Int, sessions: [CachedSleepSession],
++    private func writeVitals(whoopStore: WhoopStore, fromTs: Int, toTs: Int, sessions: [CachedSleepSession],
+                              holdingDays: Set<String> = []) async throws {
+         let cal = Calendar.current
+-        let to = HealthKitBridge.dayString(Date())
+-        guard let fromDate = cal.date(byAdding: .day, value: -days, to: Date()) else { return }
+-        let from = HealthKitBridge.dayString(fromDate)
++        let to = HealthKitBridge.dayString(Date(timeIntervalSince1970: TimeInterval(toTs)))
++        let from = HealthKitBridge.dayString(Date(timeIntervalSince1970: TimeInterval(fromTs)))
+ 
+         // day (of wake) → wake instant. Ascending session order means the latest wake of a day wins,
+         // matching collectSleep's end-date day attribution.
+-- 
+2.43.0
+
